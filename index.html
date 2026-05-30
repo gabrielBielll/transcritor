@@ -74,9 +74,9 @@
         📦 Arquivo grande detectado ({{ (arquivo.size / 1048576).toFixed(0) }} MB) — vou processar em segundo plano e te avisar por e-mail automaticamente.
       </div>
 
-      <button :disabled="!podeEnviar || carregando" @click="transcrever">
-        <span v-if="carregando" class="spinner"></span>
-        {{ carregando ? 'Transcrevendo...' : 'Transcrever' }}
+      <button :disabled="!podeEnviar || carregando || processandoFundo" @click="transcrever">
+        <span v-if="carregando || processandoFundo" class="spinner"></span>
+        {{ carregando ? 'Enviando...' : (processandoFundo ? 'Processando...' : 'Transcrever') }}
       </button>
 
       <div v-if="mensagem" :class="['status', tipoMsg]">{{ mensagem }}</div>
@@ -110,6 +110,9 @@
         const tipoMsg = ref('info');
         const segmentos = ref([]);
         const textoCompleto = ref('');
+        const nomeArquivo = ref('transcricao');
+        const processandoFundo = ref(false);
+        let pollTimer = null;
 
         // Acima disso o backend fatia o arquivo e o processamento demora —
         // então mandamos em segundo plano (e-mail) automaticamente. Mesmo
@@ -130,10 +133,52 @@
           return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
         }
 
+        // Acompanha um job em segundo plano até concluir/falhar, dando feedback ao vivo.
+        function acompanhar(base, jobId) {
+          processandoFundo.value = true;
+          const inicio = Date.now();
+
+          const tick = async () => {
+            try {
+              const r = await fetch(`${base}/status/${jobId}`);
+              if (r.status === 404) {
+                processandoFundo.value = false;
+                tipoMsg.value = 'info';
+                mensagem.value = 'O servidor reiniciou e perdeu o acompanhamento. Se você informou e-mail, o resultado chega por lá.';
+                return;
+              }
+              const d = await r.json();
+              if (d.status === 'concluido') {
+                segmentos.value = d.segmentos || [];
+                textoCompleto.value = d.texto || '';
+                processandoFundo.value = false;
+                tipoMsg.value = 'ok';
+                mensagem.value = `✅ Pronto! ${segmentos.value.length} trechos transcritos.`;
+                return;
+              }
+              if (d.status === 'erro') {
+                processandoFundo.value = false;
+                tipoMsg.value = 'err';
+                mensagem.value = '❌ ' + (d.erro || 'Falha no processamento.');
+                return;
+              }
+              // Ainda processando — mostra cronômetro e segue acompanhando.
+              const seg = Math.floor((Date.now() - inicio) / 1000);
+              tipoMsg.value = 'info';
+              mensagem.value = `⏳ Processando em segundo plano... (${seg}s) — arquivos grandes levam alguns minutos. Pode fechar a página; o resultado também vai por e-mail.`;
+              pollTimer = setTimeout(tick, 4000);
+            } catch (e) {
+              // Falha de rede transitória: tenta de novo sem desistir.
+              pollTimer = setTimeout(tick, 4000);
+            }
+          };
+          tick();
+        }
+
         async function transcrever() {
           if (!podeEnviar.value) return;
           if (modoBackground.value && !email.value) {
-            tipoMsg.value = 'err'; mensagem.value = 'O modo segundo plano precisa de um e-mail.'; return;
+            tipoMsg.value = 'err'; mensagem.value = 'Para segundo plano, informe um e-mail (canal de backup) ou desmarque a opção.'; return;
           }
 
           // Salva a URL e o e-mail pra não precisar colar de novo
@@ -141,8 +186,10 @@
           localStorage.setItem('urlBackend', base);
           localStorage.setItem('email', email.value.trim());
 
-          carregando.value = true;
+          if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+          carregando.value = true; processandoFundo.value = false;
           segmentos.value = []; textoCompleto.value = '';
+          nomeArquivo.value = (arquivo.value.name || 'transcricao').replace(/\.[^.]+$/, '');
           tipoMsg.value = 'info'; mensagem.value = 'Enviando e processando...';
 
           try {
@@ -156,8 +203,7 @@
             if (!resp.ok) throw new Error(dados.detail || 'Erro no servidor');
 
             if (dados.status === 'async_started') {
-              tipoMsg.value = 'ok';
-              mensagem.value = '✅ Despachado! O resultado vai chegar no seu e-mail.';
+              acompanhar(base, dados.job_id);
             } else {
               segmentos.value = dados.segmentos || [];
               textoCompleto.value = dados.texto || '';
@@ -177,11 +223,11 @@
           const blob = new Blob([textoCompleto.value], { type: 'text/plain' });
           const a = document.createElement('a');
           a.href = URL.createObjectURL(blob);
-          a.download = 'transcricao.txt';
+          a.download = `${nomeArquivo.value}.txt`;
           a.click();
         }
 
-        return { urlBackend, email, modoBackground, arquivo, carregando, mensagem, tipoMsg,
+        return { urlBackend, email, modoBackground, arquivo, carregando, processandoFundo, mensagem, tipoMsg,
                  segmentos, textoCompleto, podeEnviar, arquivoGrande, aoEscolher, formatTempo, transcrever, copiar, baixar };
       }
     }).mount('#app');

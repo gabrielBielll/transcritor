@@ -1,8 +1,10 @@
 import os
 import glob
+import uuid
 import base64
 import shutil
 import tempfile
+import threading
 import subprocess
 
 import requests
@@ -35,6 +37,30 @@ LIMITE_BYTES = 24 * 1024 * 1024
 DURACAO_CHUNK_S = 5 * 60
 
 MODELO = "whisper-large-v3"  # mesma qualidade do seu faster-whisper large-v3
+
+# Garante que só UM arquivo é processado por vez. Sem isso, dois jobs
+# simultâneos somariam a memória e estourariam o container pequeno (256 MB).
+# Os demais esperam na fila. Funciona tanto no modo síncrono (threadpool)
+# quanto no assíncrono (background task) — ambos rodam em threads.
+_LIMITE_JOBS = threading.BoundedSemaphore(1)
+
+# Registro em memória dos jobs assíncronos, para o frontend acompanhar o
+# progresso e baixar/copiar o resultado de arquivos grandes (não só por e-mail).
+# É volátil: se o container reiniciar, perde-se o acompanhamento — por isso o
+# e-mail continua sendo o canal durável. Podamos para não crescer sem limite.
+TRABALHOS = {}
+_TRABALHOS_LOCK = threading.Lock()
+MAX_TRABALHOS = 50
+
+
+def _registrar_trabalho(job_id, **campos):
+    with _TRABALHOS_LOCK:
+        atual = TRABALHOS.get(job_id, {})
+        atual.update(campos)
+        TRABALHOS[job_id] = atual
+        # Remove os mais antigos se passar do limite (dict preserva a ordem).
+        while len(TRABALHOS) > MAX_TRABALHOS:
+            TRABALHOS.pop(next(iter(TRABALHOS)))
 
 if not GROQ_API_KEY:
     print("⚠️  GROQ_API_KEY não configurada. Defina a variável de ambiente antes de transcrever.")
@@ -200,26 +226,33 @@ def processar(caminho, nome, email):
     opcionalmente, envia o resultado por e-mail.
     """
     try:
-        segmentos = []
-        if os.path.getsize(caminho) <= LIMITE_BYTES:
-            segmentos = transcrever_groq(caminho)
-        else:
-            print(f"Arquivo grande detectado — fatiando {nome}...")
-            pedacos = fatiar_audio(caminho)
-            dir_pedacos = os.path.dirname(pedacos[0][0]) if pedacos else None
-            try:
-                for caminho_pedaco, offset in pedacos:
-                    segmentos.extend(transcrever_groq(caminho_pedaco, offset))
-            finally:
-                if dir_pedacos and os.path.isdir(dir_pedacos):
-                    shutil.rmtree(dir_pedacos, ignore_errors=True)
+        # Fila: só um arquivo processa por vez (protege a memória do container).
+        if not _LIMITE_JOBS.acquire(blocking=False):
+            print(f"⏳ {nome} aguardando na fila (outro arquivo em processamento)...")
+            _LIMITE_JOBS.acquire()
+        try:
+            segmentos = []
+            if os.path.getsize(caminho) <= LIMITE_BYTES:
+                segmentos = transcrever_groq(caminho)
+            else:
+                print(f"Arquivo grande detectado — fatiando {nome}...")
+                pedacos = fatiar_audio(caminho)
+                dir_pedacos = os.path.dirname(pedacos[0][0]) if pedacos else None
+                try:
+                    for caminho_pedaco, offset in pedacos:
+                        segmentos.extend(transcrever_groq(caminho_pedaco, offset))
+                finally:
+                    if dir_pedacos and os.path.isdir(dir_pedacos):
+                        shutil.rmtree(dir_pedacos, ignore_errors=True)
 
-        texto = " ".join(s["text"] for s in segmentos).strip()
+            texto = " ".join(s["text"] for s in segmentos).strip()
 
-        if email:
-            enviar_email_resend(email, nome, segmentos)
+            if email:
+                enviar_email_resend(email, nome, segmentos)
 
-        return segmentos, texto
+            return segmentos, texto
+        finally:
+            _LIMITE_JOBS.release()
     except Exception as e:  # noqa: BLE001
         # Em modo background a exceção morreria silenciosa — avisa por e-mail.
         print(f"❌ Erro ao processar {nome}: {e}")
@@ -230,6 +263,26 @@ def processar(caminho, nome, email):
         if os.path.exists(caminho):
             os.remove(caminho)
             print(f"🧹 Limpeza: {nome} removido do disco.")
+
+
+def processar_async(job_id, caminho, nome, email):
+    """Roda em segundo plano e grava o resultado no registro de jobs.
+
+    Engole qualquer exceção (apenas registra como erro) para que uma falha
+    nunca derrube a aplicação — ela continua de pé e pronta para o próximo
+    áudio. O semáforo já é liberado dentro de `processar`.
+    """
+    try:
+        segmentos, texto = processar(caminho, nome, email)
+        _registrar_trabalho(
+            job_id, status="concluido", segmentos=segmentos, texto=texto, erro=None
+        )
+        print(f"✅ Job {job_id} ({nome}) concluído.")
+    except Exception as e:  # noqa: BLE001
+        _registrar_trabalho(
+            job_id, status="erro", segmentos=[], texto="", erro=str(e)
+        )
+        print(f"❌ Job {job_id} ({nome}) falhou: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -255,16 +308,18 @@ async def handle_transcription(
     temp.close()
 
     if run_async:
-        if not email:
-            os.remove(temp.name)
-            raise HTTPException(
-                status_code=400,
-                detail="Modo assíncrono precisa de um e-mail para notificar.",
-            )
-        background_tasks.add_task(processar, temp.name, file.filename, email)
+        job_id = uuid.uuid4().hex
+        _registrar_trabalho(
+            job_id, status="processando", nome=file.filename,
+            segmentos=[], texto="", erro=None,
+        )
+        background_tasks.add_task(
+            processar_async, job_id, temp.name, file.filename, email
+        )
         return {
             "status": "async_started",
-            "message": "Transcrição despachada. Você receberá o resultado por e-mail.",
+            "job_id": job_id,
+            "message": "Transcrição despachada. Acompanhe aqui ou aguarde o e-mail.",
         }
 
     try:
@@ -274,6 +329,19 @@ async def handle_transcription(
         return {"status": "completed", "segmentos": segmentos, "texto": texto}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/status/{job_id}")
+def status_trabalho(job_id: str):
+    """Acompanhamento de um job assíncrono: processando | concluido | erro."""
+    trabalho = TRABALHOS.get(job_id)
+    if not trabalho:
+        raise HTTPException(
+            status_code=404,
+            detail="Trabalho não encontrado (expirou ou o servidor reiniciou). "
+                   "Se você informou e-mail, o resultado chega por lá.",
+        )
+    return trabalho
 
 
 # Execução local: `python main.py` (no Northflank o Dockerfile cuida disso).

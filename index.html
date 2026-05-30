@@ -67,7 +67,11 @@
 
       <div class="row check">
         <input type="checkbox" id="bg" v-model="modoBackground" :disabled="!email" />
-        <label for="bg" style="margin:0;">Arquivo grande? Processar em segundo plano e avisar por e-mail (precisa de e-mail)</label>
+        <label for="bg" style="margin:0;">Processar em segundo plano e avisar por e-mail (precisa de e-mail)</label>
+      </div>
+
+      <div v-if="arquivoGrande" class="status info" style="margin-bottom:14px;">
+        📦 Arquivo grande detectado ({{ (arquivo.size / 1048576).toFixed(0) }} MB) — vou processar em segundo plano e te avisar por e-mail automaticamente.
       </div>
 
       <button :disabled="!podeEnviar || carregando" @click="transcrever">
@@ -98,7 +102,7 @@
     createApp({
       setup() {
         const urlBackend = ref(localStorage.getItem('urlBackend') || 'https://b--transcritor-backend--rjwnmzf6pscr.code.run');
-        const email = ref('');
+        const email = ref(localStorage.getItem('email') || 'gabrielbarbosa.ff@gmail.com');
         const modoBackground = ref(false);
         const arquivo = ref(null);
         const carregando = ref(false);
@@ -107,9 +111,19 @@
         const segmentos = ref([]);
         const textoCompleto = ref('');
 
-        const podeEnviar = computed(() => urlBackend.value.trim() && arquivo.value);
+        // Acima disso o backend fatia o arquivo e o processamento demora —
+        // então mandamos em segundo plano (e-mail) automaticamente. Mesmo
+        // limite usado no backend (LIMITE_BYTES).
+        const LIMITE_GRANDE = 24 * 1024 * 1024;
 
-        function aoEscolher(e) { arquivo.value = e.target.files[0] || null; }
+        const podeEnviar = computed(() => urlBackend.value.trim() && arquivo.value);
+        const arquivoGrande = computed(() => arquivo.value && arquivo.value.size > LIMITE_GRANDE);
+
+        function aoEscolher(e) {
+          arquivo.value = e.target.files[0] || null;
+          // Detecta sozinho: arquivo grande => segundo plano (sem precisar marcar).
+          if (arquivoGrande.value) modoBackground.value = true;
+        }
 
         function formatTempo(seg) {
           const m = Math.floor(seg / 60), s = Math.floor(seg % 60);
@@ -122,9 +136,10 @@
             tipoMsg.value = 'err'; mensagem.value = 'O modo segundo plano precisa de um e-mail.'; return;
           }
 
-          // Salva a URL pra não precisar colar de novo
+          // Salva a URL e o e-mail pra não precisar colar de novo
           const base = urlBackend.value.trim().replace(/\/$/, '');
           localStorage.setItem('urlBackend', base);
+          localStorage.setItem('email', email.value.trim());
 
           carregando.value = true;
           segmentos.value = []; textoCompleto.value = '';
@@ -167,7 +182,7 @@
         }
 
         return { urlBackend, email, modoBackground, arquivo, carregando, mensagem, tipoMsg,
-                 segmentos, textoCompleto, podeEnviar, aoEscolher, formatTempo, transcrever, copiar, baixar };
+                 segmentos, textoCompleto, podeEnviar, arquivoGrande, aoEscolher, formatTempo, transcrever, copiar, baixar };
       }
     }).mount('#app');
   </script>

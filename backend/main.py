@@ -1,11 +1,12 @@
 import os
+import glob
 import base64
 import shutil
 import tempfile
+import subprocess
 
 import requests
 from groq import Groq
-from pydub import AudioSegment
 from fastapi import (
     FastAPI,
     File,
@@ -28,9 +29,10 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 # de segurança para decidir quando precisamos fatiar.
 LIMITE_BYTES = 24 * 1024 * 1024
 
-# Duração de cada pedaço quando o arquivo é grande (10 min em milissegundos).
-# A 16 kHz mono, 10 min de WAV dá ~19 MB, abaixo do limite de 25 MB.
-DURACAO_CHUNK_MS = 10 * 60 * 1000
+# Duração de cada pedaço quando o arquivo é grande (5 min em segundos).
+# A 16 kHz mono, 5 min de WAV dá ~9,6 MB — bem abaixo do limite de 25 MB
+# do Groq e leve na RAM (importa em containers pequenos, ex.: 256 MB).
+DURACAO_CHUNK_S = 5 * 60
 
 MODELO = "whisper-large-v3"  # mesma qualidade do seu faster-whisper large-v3
 
@@ -67,14 +69,14 @@ def transcrever_groq(caminho_audio, offset_segundos=0.0):
     continuem corretos em relação ao áudio original inteiro.
     """
     with open(caminho_audio, "rb") as fh:
-        dados = fh.read()
-
-    resposta = groq.audio.transcriptions.create(
-        file=(os.path.basename(caminho_audio), dados),
-        model=MODELO,
-        language="pt",
-        response_format="verbose_json",  # traz segmentos com start/end/text
-    )
+        resposta = groq.audio.transcriptions.create(
+            # Passa o handle aberto (não fh.read()) pra não segurar o arquivo
+            # inteiro na RAM — o cliente transmite em streaming.
+            file=(os.path.basename(caminho_audio), fh),
+            model=MODELO,
+            language="pt",
+            response_format="verbose_json",  # traz segmentos com start/end/text
+        )
 
     segmentos = []
     for s in (resposta.segments or []):
@@ -89,22 +91,35 @@ def transcrever_groq(caminho_audio, offset_segundos=0.0):
 
 
 def fatiar_audio(caminho):
-    """Quebra um áudio grande em pedaços de DURACAO_CHUNK_MS.
+    """Quebra um áudio grande em pedaços de DURACAO_CHUNK_S.
 
-    Converte para 16 kHz mono (formato que o Groq usa internamente, então
-    não há perda de qualidade) e exporta cada pedaço como WAV temporário.
+    Usa o ffmpeg em streaming (segment muxer): ele lê o arquivo aos poucos,
+    converte para 16 kHz mono — formato que o Groq usa internamente, sem
+    perda de qualidade — e grava cada pedaço como WAV no disco, SEM carregar
+    o áudio inteiro na memória (era isso que estourava a RAM antes).
+
     Retorna uma lista de (caminho_do_pedaco, offset_em_segundos).
     """
-    audio = AudioSegment.from_file(caminho)
-    audio = audio.set_frame_rate(16000).set_channels(1)
+    dir_saida = tempfile.mkdtemp(prefix="chunks_")
+    padrao = os.path.join(dir_saida, "chunk_%05d.wav")
+
+    subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-y",
+            "-i", caminho,
+            "-ar", "16000", "-ac", "1",
+            "-f", "segment",
+            "-segment_time", str(DURACAO_CHUNK_S),
+            "-reset_timestamps", "1",
+            padrao,
+        ],
+        check=True,
+        capture_output=True,
+    )
 
     pedacos = []
-    for inicio_ms in range(0, len(audio), DURACAO_CHUNK_MS):
-        pedaco = audio[inicio_ms:inicio_ms + DURACAO_CHUNK_MS]
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        pedaco.export(tmp.name, format="wav")
-        tmp.close()
-        pedacos.append((tmp.name, inicio_ms / 1000.0))
+    for i, caminho_pedaco in enumerate(sorted(glob.glob(os.path.join(dir_saida, "chunk_*.wav")))):
+        pedacos.append((caminho_pedaco, float(i * DURACAO_CHUNK_S)))
     return pedacos
 
 
@@ -151,6 +166,33 @@ def enviar_email_resend(email_destino, nome_original, segmentos):
         print(f"❌ Erro ao enviar e-mail: {e}")
 
 
+def enviar_email_falha(email_destino, nome_original, motivo):
+    """Avisa o usuário quando a transcrição falhou (ex.: em modo background)."""
+    if not RESEND_API_KEY:
+        return
+    try:
+        headers = {
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "from": "Transcrição IA <onboarding@resend.dev>",
+            "to": [email_destino],
+            "subject": f"Falha na transcrição: {nome_original}",
+            "html": (
+                f"<h3>Ops!</h3>"
+                f"<p>Não consegui transcrever o arquivo <b>{nome_original}</b>.</p>"
+                f"<p>Motivo técnico: {motivo}</p>"
+                f"<p>Tente novamente; se o arquivo for muito grande, divida-o.</p>"
+            ),
+        }
+        requests.post(
+            "https://api.resend.com/emails", headers=headers, json=payload, timeout=30
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"❌ Erro ao enviar e-mail de falha: {e}")
+
+
 def processar(caminho, nome, email):
     """Trabalho pesado (síncrono). Roda em threadpool ou em background.
 
@@ -163,12 +205,14 @@ def processar(caminho, nome, email):
             segmentos = transcrever_groq(caminho)
         else:
             print(f"Arquivo grande detectado — fatiando {nome}...")
-            for caminho_pedaco, offset in fatiar_audio(caminho):
-                try:
+            pedacos = fatiar_audio(caminho)
+            dir_pedacos = os.path.dirname(pedacos[0][0]) if pedacos else None
+            try:
+                for caminho_pedaco, offset in pedacos:
                     segmentos.extend(transcrever_groq(caminho_pedaco, offset))
-                finally:
-                    if os.path.exists(caminho_pedaco):
-                        os.remove(caminho_pedaco)
+            finally:
+                if dir_pedacos and os.path.isdir(dir_pedacos):
+                    shutil.rmtree(dir_pedacos, ignore_errors=True)
 
         texto = " ".join(s["text"] for s in segmentos).strip()
 
@@ -176,6 +220,12 @@ def processar(caminho, nome, email):
             enviar_email_resend(email, nome, segmentos)
 
         return segmentos, texto
+    except Exception as e:  # noqa: BLE001
+        # Em modo background a exceção morreria silenciosa — avisa por e-mail.
+        print(f"❌ Erro ao processar {nome}: {e}")
+        if email:
+            enviar_email_falha(email, nome, str(e))
+        raise
     finally:
         if os.path.exists(caminho):
             os.remove(caminho)

@@ -97,7 +97,7 @@
     const { createApp, ref, computed } = Vue;
     createApp({
       setup() {
-        const urlBackend = ref(localStorage.getItem('urlBackend') || '');
+        const urlBackend = ref(localStorage.getItem('urlBackend') || 'https://b--transcritor-backend--rjwnmzf6pscr.code.run');
         const email = ref('');
         const modoBackground = ref(false);
         const arquivo = ref(null);
